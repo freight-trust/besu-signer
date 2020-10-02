@@ -1,0 +1,489 @@
+/*
+ * Copyright 2018 ConsenSys AG.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations under the License.
+ */
+
+import net.ltgt.gradle.errorprone.CheckSeverity
+
+import java.text.SimpleDateFormat
+
+plugins {
+  id 'com.diffplug.gradle.spotless' version '3.27.1'
+  id 'com.github.ben-manes.versions' version '0.27.0'
+  id 'com.github.hierynomus.license' version '0.15.0'
+  id 'io.spring.dependency-management' version '1.0.9.RELEASE'
+  id 'me.champeau.gradle.jmh' version '0.5.0' apply false
+  id 'net.ltgt.errorprone' version '1.1.1'
+  id 'net.researchgate.release' version '2.8.1'
+}
+
+String projectName = "AccountGenerator"
+String repositoryName = projectName.toLowerCase()
+String projectHome = projectName.toUpperCase() + "_HOME"
+
+if (!JavaVersion.current().java11Compatible) {
+  throw new GradleException("Java 11 or later is required to build AccountGenerator.\n" +
+  "  Detected version ${JavaVersion.current()}")
+}
+def dockerRepo = "adharatech"
+
+group = 'tech.pegasys.accountgenerator'
+
+defaultTasks 'build', 'checkLicenses', 'javadoc'
+
+def buildAliases = ['dev': [
+    'spotlessApply',
+    'build',
+    'checkLicenses',
+    'javadoc'
+  ]]
+
+def expandedTaskList = []
+gradle.startParameter.taskNames.each {
+  expandedTaskList << (buildAliases[it] ? buildAliases[it] : it)
+}
+gradle.startParameter.taskNames = expandedTaskList.flatten()
+
+// Gets a integer command argument, passed with -Pname=x, or the defaut if not provided.
+def _intCmdArg(name, defaultValue) {
+  return project.hasProperty(name) ? project.property(name) as int : defaultValue
+}
+
+def _intCmdArg(name) {
+  return _intCmdArg(name, null)
+}
+
+def _strListCmdArg(name, defaultValue) {
+  if (!project.hasProperty(name))
+    return defaultValue
+
+  return ((String)project.property(name)).tokenize(',')
+}
+
+def _strListCmdArg(name) {
+  return _strListCmdArg(name, null)
+}
+
+
+allprojects {
+  apply plugin: 'java-library'
+  apply plugin: 'io.spring.dependency-management'
+  apply plugin: 'jacoco'
+  apply plugin: 'net.ltgt.errorprone'
+  apply from: "${rootDir}/gradle/versions.gradle"
+  apply from: "${rootDir}/gradle/check-licenses.gradle"
+
+  version = rootProject.version
+
+  jacoco { toolVersion = '0.8.5' }
+
+  task sourcesJar(type: Jar, dependsOn: classes) {
+    classifier = 'sources'
+    from sourceSets.main.allSource
+  }
+
+  task javadocJar(type: Jar, dependsOn: javadoc) {
+    classifier = 'javadoc'
+    from javadoc.destinationDir
+  }
+
+  sourceCompatibility = 11
+  targetCompatibility = 11
+
+  repositories {
+    jcenter()
+    mavenCentral()
+  }
+
+  dependencies {
+    compile fileTree(dir: "${rootDir}/libs", include: "*.jar")
+    errorprone("com.google.errorprone:error_prone_core")
+  }
+
+  apply plugin: 'groovy'
+
+  apply plugin: 'com.diffplug.gradle.spotless'
+  spotless {
+    java {
+      // This path needs to be relative to each project
+      target fileTree('.') {
+        include '**/*.java'
+        exclude '**/.gradle/**'
+      }
+      removeUnusedImports()
+      googleJavaFormat('1.7')
+      importOrder 'tech.pegasys', 'java', ''
+      trimTrailingWhitespace()
+      endWithNewline()
+      licenseHeaderFile "${rootDir}/gradle/spotless.java.license"
+    }
+
+    // Below this line are currently only license header tasks
+    format 'groovy', {
+      target '**/*.groovy'
+      licenseHeaderFile "${rootDir}/gradle/spotless.java.license", 'import'
+    }
+  }
+
+  tasks.withType(JavaCompile) {
+    options.compilerArgs += [
+      '-Xlint:unchecked',
+      '-Xlint:cast',
+      '-Xlint:rawtypes',
+      '-Xlint:overloads',
+      '-Xlint:divzero',
+      '-Xlint:finally',
+      '-Xlint:static',
+      '-Werror',
+    ]
+
+    options.errorprone {
+      excludedPaths = '.*/(generated/*.*|.*ReferenceTest_.*)'
+
+      // Our equals need to be symmetric, this checker doesn't respect that.
+      check('EqualsGetClass', CheckSeverity.OFF)
+      // We like to use futures with no return values.
+      check('FutureReturnValueIgnored', CheckSeverity.OFF)
+      // We use the JSR-305 annotations instead of the Google annotations.
+      check('ImmutableEnumChecker', CheckSeverity.OFF)
+      // This is a style check instead of an error-prone pattern.
+      check('UnnecessaryParentheses', CheckSeverity.OFF)
+      // Lazy impl causes excess CPU usage O(n) of non-final fiield when it should be O(1).
+      check('FieldCanBeFinal', CheckSeverity.OFF)
+      // Incorrectly fires when there are no java.time.* alternatives
+      check('PreferJavaTimeOverload', CheckSeverity.OFF)
+
+      check('InsecureCryptoUsage', CheckSeverity.WARN)
+      check('WildcardImport', CheckSeverity.WARN)
+    }
+
+    options.encoding = 'UTF-8'
+  }
+
+  test {
+    jvmArgs = [
+      '-Xmx4g',
+      '-XX:-UseGCOverheadLimit',
+      // Mockito and jackson-databind do some strange reflection during tests.
+      // This suppresses an illegal access warning.
+      '--add-opens',
+      'java.base/java.util=ALL-UNNAMED',
+      '--add-opens',
+      'java.base/java.util.concurrent=ALL-UNNAMED'
+    ]
+    Set toImport = [
+      'root.log.level',
+      'evm.log.level'
+    ]
+    for (String name : toImport) {
+      if (System.getProperty(name) != null) {
+        systemProperty name, System.getProperty(name)
+      }
+    }
+
+    useJUnitPlatform()
+  }
+
+  javadoc {
+    options.addStringOption('Xdoclint:all', '-quiet')
+    options.addStringOption('Xwerror', '-html5')
+    options.encoding = 'UTF-8'
+  }
+
+}
+
+task deploy() {}
+
+
+subprojects {
+
+  if (file('src/main/java').directory) {
+    apply plugin: 'maven-publish'
+
+    publishing {
+      publications {
+        mavenJava(MavenPublication) {
+          groupId "tech.pegasys.accountgenerator.internal"
+          version "${project.version}"
+          from components.java
+          artifact sourcesJar
+          artifact javadocJar
+          versionMapping {
+            usage('java-api') { fromResolutionOf('runtimeClasspath') }
+            usage('java-runtime') { fromResolutionResult() }
+          }
+          pom {
+            name = "AccountGenerator - ${project.name}"
+            url = 'http://github.com/mkrielza/accountgenerator'
+            licenses {
+              license {
+                name = 'The Apache License, Version 2.0'
+                url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+              }
+            }
+            scm {
+              connection = 'scm:git:git://github.com/spikes/accountgenerator.git'
+              developerConnection = 'scm:git:ssh://github.com/spikes/accountgenerator.git'
+              url = 'https://github.com/spikes/accountgenerator'
+            }
+          }
+        }
+      }
+    }
+  }
+
+  tasks.withType(Test) {
+    // If GRADLE_MAX_TEST_FORKS is not set, use half the available processors
+    maxParallelForks = (System.getenv('GRADLE_MAX_TEST_FORKS') ?: (Runtime.runtime.availableProcessors().intdiv(2) ?: 1)).toInteger()
+    systemProperty "java.library.path", "/opt/cloudhsm/lib"
+  }
+
+  tasks.withType(JavaCompile) {
+    options.fork = true
+    options.incremental = true
+  }
+
+  if (file('src/jmh').directory) {
+    apply plugin: 'me.champeau.gradle.jmh'
+
+    jmh {
+      // Allows to control JMH execution directly from the command line. I typical execution may look
+      // like:
+      //    gradle jmh -Pf=2 -Pwi=3 -Pi=5 -Pinclude=MyBench
+      // which will run 2 forks with 3 warmup iterations and 5 normal ones for each, and will only
+      // run the benchmark matching 'MyBench' (a regexp).
+      warmupForks = _intCmdArg('wf')
+      warmupIterations = _intCmdArg('wi')
+      fork = _intCmdArg('f')
+      iterations = _intCmdArg('i')
+      benchmarkMode = _strListCmdArg('bm')
+      include = _strListCmdArg('include', [''])
+      humanOutputFile = project.file("${project.buildDir}/reports/jmh/results.txt")
+      resultFormat = 'JSON'
+    }
+
+    dependencies { jmh 'org.apache.logging.log4j:log4j-api' }
+  }
+}
+
+jar { enabled = false }
+
+apply plugin: 'application'
+mainClassName = "tech.pegasys.accountgenerator.AccountGeneratorApp"
+applicationDefaultJvmArgs = [
+  "-Dvertx.disableFileCPResolving=true",
+  // We shutdown log4j ourselves, as otherwise his shutdown hook runs before our own and whatever
+  // happens during shutdown is not logged.
+  "-Dlog4j.shutdownHookEnabled=false",
+  "-Djava.library.path=/opt/cloudhsm/lib"
+]
+
+run {
+  args project.hasProperty("accountgenerator.run.args") ? project.property("accountgenerator.run.args").toString().split("\\s+") : []
+  doFirst {
+    applicationDefaultJvmArgs = applicationDefaultJvmArgs.collect{it.replace('ACCOUNT_GENERATOR_HOME', "$buildDir/accountgenerator")}
+  }
+}
+
+startScripts {
+
+  def shortenWindowsClasspath = { line ->
+    line = line.replaceAll(/^set CLASSPATH=.*$/, "set CLASSPATH=%APP_HOME%/lib/*")
+  }
+
+  doLast {
+    unixScript.text = unixScript.text.replace('ACCOUNT_GENERATOR_HOME', '\$APP_HOME')
+    windowsScript.text = windowsScript.text.replace('ACCOUNT_GENERATOR_HOME', '%~dp0..')
+
+    // Prevent the error originating from the 8191 chars limit on Windows
+    windowsScript.text =
+      windowsScript
+      .readLines()
+      .collect(shortenWindowsClasspath)
+      .join('\r\n')
+  }
+}
+
+dependencies {
+  implementation project(':accountgenerator:app')
+  errorprone 'com.google.errorprone:error_prone_core'
+  runtime fileTree(dir: 'libs', include: '*.jar')
+}
+
+distributions {
+  main {
+    contents {
+      from("./accountgenerator/generator/cavium/src/main/resources/sas.sh") { into "scripts" }
+      from("./LICENSE") { into "." }
+      from("build/reports/license/license-dependency.html") { into "." }
+      from("./docs/GettingStartedBinaries.md") { into "." }
+      from("./docs/DocsArchive0.8.0.html") { into "." }
+    }
+  }
+}
+
+installDist {
+  dependsOn checkLicenses
+}
+
+distTar {
+  dependsOn checkLicenses
+  doFirst {
+    delete fileTree(dir: 'build/distributions', include: '*.tar.gz')
+  }
+  compression = Compression.GZIP
+  archiveExtension = 'tar.gz'
+}
+
+distZip {
+  dependsOn checkLicenses
+  doFirst {
+    delete fileTree(dir: 'build/distributions', include: '*.zip')
+  }
+}
+
+
+// rename the top level dir from <reponame>-<version> to <reponame> and this makes it really
+// simple for use in docker
+tasks.register("dockerDistUntar") {
+  dependsOn distTar
+  dependsOn distZip
+  def dockerBuildDir = "build/docker-" + repositoryName + "/"
+  def distTarFile = distTar.outputs.files.singleFile
+  def distTarFileName = distTar.outputs.files.singleFile.name.replace(".tar.gz", "")
+
+  doFirst {
+    new File(dockerBuildDir).mkdir()
+    copy {
+      from tarTree(distTarFile)
+      into(dockerBuildDir)
+    }
+    file("${dockerBuildDir}/${distTarFileName}").renameTo("${dockerBuildDir}/" + repositoryName)
+  }
+}
+
+task distDocker(type: Exec) {
+  def tagSuffix = project.hasProperty("dockerfile")? "-" + dockerfile : ""
+  def dockerfile = project.hasProperty("dockerfile")? dockerfile + ".Dockerfile" : "Dockerfile"
+  dependsOn dockerDistUntar
+  def dockerBuildVersion = project.hasProperty('release.releaseVersion') ? project.property('release.releaseVersion') : "${rootProject.version}"
+  def imageName = dockerRepo + "/" + repositoryName
+  def image = project.hasProperty('release.releaseVersion') ? "${imageName}:" + project.property('release.releaseVersion')  + "${tagSuffix}": "${imageName}:${project.version}${tagSuffix}"
+  def dockerBuildDir = "build/docker-" + repositoryName + "/"
+  workingDir "${dockerBuildDir}"
+
+  doFirst {
+    copy {
+      from file("${projectDir}/docker/" + dockerfile)
+      into(workingDir)
+    }
+    copy {
+      from file("${projectDir}/docker/cloudhsm-entrypoint.sh")
+      into(workingDir)
+    }
+  }
+
+  executable "sh"
+  args "-c", "docker build -f ${dockerfile} --build-arg BUILD_DATE=${buildTime()} --build-arg VERSION=${dockerBuildVersion} --build-arg VCS_REF=${getCheckedOutGitCommitHash()} -t ${image} ."
+}
+
+task dockerUpload(type: Exec) {
+  dependsOn distDocker
+  def tagSuffix = project.hasProperty("dockerfile")? "-" + dockerfile : ""
+  def imageName = dockerRepo + "/" + repositoryName
+  def image = project.hasProperty('release.releaseVersion') ? "${imageName}:" + project.property('release.releaseVersion')  + "${tagSuffix}": "${imageName}:${project.version}${tagSuffix}"
+  def cmd = "docker push '${image}'"
+  def additionalTags = []
+
+  if (project.hasProperty('branch') && project.property('branch') == 'master') {
+    additionalTags.add("develop${tagSuffix}")
+  }
+
+  if (!(version ==~ /.*-SNAPSHOT/)) {
+    additionalTags.add("latest${tagSuffix}")
+    additionalTags.add(version.split(/\./)[0..1].join('.') + "${tagSuffix}")
+  }
+
+  additionalTags.each { tag -> cmd += " && docker tag '${image}' '${imageName}:${tag.trim()}' && docker push '${imageName}:${tag.trim()}'" }
+  executable "sh"
+  args "-c", cmd
+}
+
+task jacocoRootReport(type: org.gradle.testing.jacoco.tasks.JacocoReport) {
+  additionalSourceDirs.from files(subprojects.sourceSets.main.allSource.srcDirs)
+  sourceDirectories.from files(subprojects.sourceSets.main.allSource.srcDirs)
+  classDirectories.from files(subprojects.sourceSets.main.output)
+  executionData.from files(subprojects.jacocoTestReport.executionData) //how to exclude some package/classes com.test.**
+  reports {
+    xml.enabled true
+    csv.enabled true
+    html.destination file("build/reports/jacocoHtml")
+  }
+  onlyIf = { true }
+  doFirst {
+    executionData = files(executionData.findAll { it.exists() })
+  }
+}
+
+configurations { annotationProcessor }
+
+
+// http://label-schema.org/rc1/
+// using the RFC3339 format "2016-04-12T23:20:50.52Z"
+def buildTime() {
+  def df = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm'Z'")
+  df.setTimeZone(TimeZone.getTimeZone("UTC"))
+  return df.format(new Date())
+}
+
+// Takes the version, and if -SNAPSHOT is part of it replaces SNAPSHOT
+// with the git commit version.
+def calculateVersion() {
+  String version = rootProject.version
+  return version
+}
+
+def getCheckedOutGitCommitHash() {
+  def gitFolder = "$projectDir/.git/"
+  if (!file(gitFolder).isDirectory()) {
+    // We are in a submodule.  The file's contents are `gitdir: <gitFolder>\n`.
+    // Read the file, cut off the front, and trim the whitespace.
+    gitFolder = file(gitFolder).text.substring(8).trim() + "/"
+  }
+  def takeFromHash = 8
+  /*
+   * '.git/HEAD' contains either
+   *      in case of detached head: the currently checked out commit hash
+   *      otherwise: a reference to a file containing the current commit hash
+   */
+  def head = new File(gitFolder + "HEAD").text.split(":") // .git/HEAD
+  def isCommit = head.length == 1 // e5a7c79edabbf7dd39888442df081b1c9d8e88fd
+
+  if (isCommit) return head[0].trim().take(takeFromHash) // e5a7c79edabb
+
+  def refHead = new File(gitFolder + head[1].trim()) // .git/refs/heads/master
+  refHead.text.trim().take takeFromHash
+}
+
+release {
+  preTagCommitMessage = '[Gradle Release Plugin] - pre tag commit: '
+  tagCommitMessage = '[Gradle Release Plugin] - creating tag: '
+  newVersionCommitMessage = '[Gradle Release Plugin] - new version commit: '
+  buildTasks = [
+          'build',
+          'checkLicenses',
+          'javadoc'
+  ]
+
+  git {
+    requireBranch = project.hasProperty('release.branch') ? project.property('release.branch') : 'master'
+  }
+}
